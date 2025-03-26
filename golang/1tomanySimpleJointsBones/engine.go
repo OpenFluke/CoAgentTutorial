@@ -10,47 +10,62 @@ import (
 	"time"
 )
 
+// ----------------------------------------------------------------
+// Adjust these to match your environment
+// ----------------------------------------------------------------
 const (
-	SERVER_IP      = "127.0.0.1" // or "192.168.0.116" if needed
+	SERVER_IP      = "127.0.0.1"
 	SERVER_PORT    = 14000
 	SHARED_PASS    = "my_secure_password"
 	END_OF_MSG     = "<???DONE???---"
 	SOCKET_TIMEOUT = 2 * time.Second
-	NUM_CUBES      = 10              // Number of cubes in the snake
-	TEST_DURATION  = 5 * time.Second // Duration to observe each snake
+
+	NUM_CUBES     = 6               // number of cubes per "snake"
+	TEST_DURATION = 5 * time.Second // how long we watch each snake
 )
 
-// We test these 5 types: 4 normal joints plus "bone"
+// We'll test all 5 types
 var testTypes = []string{"pin", "hinge", "slider", "conetwist", "bone"}
 
-// CubeListResponse struct to parse the server's "get_cube_list" response.
+// ----------------------------------------------------------------
+// For parsing the server's "get_cube_list" response
+// ----------------------------------------------------------------
 type CubeListResponse struct {
 	Type  string   `json:"type"`
 	Cubes []string `json:"cubes"`
 }
 
-// sendMessage appends the end-of-message marker and writes to the connection.
+// For parsing "joint_created" / "bone_created" server responses
+type JointCreationResponse struct {
+	Type      string `json:"type"`
+	JointName string `json:"joint_name"`
+}
+
+// ----------------------------------------------------------------
+// Utility: send a message with the END_OF_MSG marker
+// ----------------------------------------------------------------
 func sendMessage(conn net.Conn, message string) error {
 	fullMsg := message + END_OF_MSG
 	_, err := conn.Write([]byte(fullMsg))
-	if err != nil {
-		return fmt.Errorf("failed to send message: %v", err)
-	}
-	return nil
+	return err
 }
 
-// receiveMessage reads from the connection until it finds the END_OF_MSG marker.
+// ----------------------------------------------------------------
+// Utility: read until we find END_OF_MSG or time out
+// ----------------------------------------------------------------
 func receiveMessage(conn net.Conn) (string, error) {
 	conn.SetReadDeadline(time.Now().Add(SOCKET_TIMEOUT))
+
 	var buffer bytes.Buffer
 	tmp := make([]byte, 1024)
+
 	for {
 		n, err := conn.Read(tmp)
 		if err != nil {
 			if err == io.EOF {
 				break
 			}
-			// If we timed out but have some data, we break out to parse what we have
+			// If we timed out but have partial data, parse it
 			if netErr, ok := err.(net.Error); ok && netErr.Timeout() && buffer.Len() > 0 {
 				break
 			}
@@ -61,194 +76,314 @@ func receiveMessage(conn net.Conn) (string, error) {
 			break
 		}
 	}
+
 	result := buffer.String()
-	idx := strings.Index(result, END_OF_MSG)
-	if idx >= 0 {
+	if idx := strings.Index(result, END_OF_MSG); idx >= 0 {
 		result = result[:idx]
 	}
 	return strings.TrimSpace(result), nil
 }
 
+// ----------------------------------------------------------------
+// MAIN
+// ----------------------------------------------------------------
 func main() {
-	fmt.Println("Starting program to test snake structures with various joint/bone types...")
-
-	// 1) Connect to the server
+	fmt.Printf("Connecting to server at %s:%d...\n", SERVER_IP, SERVER_PORT)
 	conn, err := net.Dial("tcp", fmt.Sprintf("%s:%d", SERVER_IP, SERVER_PORT))
 	if err != nil {
-		fmt.Printf("Failed to connect to server: %v\n", err)
+		fmt.Printf("Connection error: %v\n", err)
 		return
 	}
 	defer conn.Close()
 
-	// 2) Authenticate with the server
+	// 1) Authenticate
 	if err := sendMessage(conn, SHARED_PASS); err != nil {
-		fmt.Printf("Authentication send error: %v\n", err)
+		fmt.Printf("Failed to send auth: %v\n", err)
 		return
 	}
 	authResp, err := receiveMessage(conn)
 	if err != nil || authResp != "auth_success" {
-		fmt.Printf("Authentication failed: %s %v\n", authResp, err)
+		fmt.Printf("Authentication failed. Server said '%s' (err=%v)\n", authResp, err)
 		return
 	}
-	fmt.Println("Authenticated successfully")
+	fmt.Println("Authenticated successfully!")
 
-	// 3) Loop over each test type (pin, hinge, slider, conetwist, bone)
+	// 2) For each joint/bone type, build & test a “snake”
 	for _, t := range testTypes {
 		fmt.Printf("\n=== Testing type: %s ===\n", t)
 
 		// Step A: Spawn cubes
-		var cubeNames []string
 		for i := 0; i < NUM_CUBES; i++ {
-			spawnPos := []float64{float64(i * 2), 100, 40} // space them along X
-			spawnCubeCmd := map[string]interface{}{
+			spawnPos := []float64{float64(i * 2), 100, 40} // each 2 units apart along X
+			spawnCmd := map[string]interface{}{
 				"type":     "spawn_cube",
 				"position": spawnPos,
 				"rotation": []float64{0, 0, 0},
 			}
-			cmdBytes, _ := json.Marshal(spawnCubeCmd)
-			if err := sendMessage(conn, string(cmdBytes)); err != nil {
-				fmt.Printf("Failed to spawn cube %d: %v\n", i, err)
+			if err := sendCommand(conn, spawnCmd); err != nil {
+				fmt.Printf("Error spawning cube %d: %v\n", i, err)
 				return
 			}
-			fmt.Printf("Spawned cube %d at %v\n", i, spawnPos)
 			time.Sleep(100 * time.Millisecond)
 		}
 
-		// Wait a bit for the server to finish spawning
+		// Wait for server to create them
 		time.Sleep(1 * time.Second)
 
-		// Step B: Get the list of spawned cubes
-		getCubeListCmd := map[string]interface{}{
-			"type": "get_cube_list",
-		}
-		if data, err := json.Marshal(getCubeListCmd); err == nil {
-			if err := sendMessage(conn, string(data)); err != nil {
-				fmt.Printf("Failed to send get_cube_list: %v\n", err)
-				return
-			}
-		} else {
-			fmt.Printf("Failed to marshal get_cube_list: %v\n", err)
+		// Step B: Get list of cubes (the last N are ours)
+		if err := sendCommand(conn, map[string]interface{}{"type": "get_cube_list"}); err != nil {
+			fmt.Printf("Error requesting cube list: %v\n", err)
 			return
 		}
-
-		resp, err := receiveMessage(conn)
+		listRespStr, err := receiveMessage(conn)
 		if err != nil {
-			fmt.Printf("Failed to receive cube list: %v\n", err)
+			fmt.Printf("Error reading cube list: %v\n", err)
 			return
 		}
-		var cubeListResp CubeListResponse
-		if err := json.Unmarshal([]byte(resp), &cubeListResp); err != nil {
-			fmt.Printf("Failed to parse cube list response: %v\n", err)
+		var cubesList CubeListResponse
+		if err := json.Unmarshal([]byte(listRespStr), &cubesList); err != nil {
+			fmt.Printf("Error unmarshaling cube list: %v\n", err)
 			return
 		}
-		if cubeListResp.Type != "cube_list" {
-			fmt.Printf("Invalid response type: %s\n", cubeListResp.Type)
+		if cubesList.Type != "cube_list" || len(cubesList.Cubes) < NUM_CUBES {
+			fmt.Printf("Invalid cube list response: %+v\n", cubesList)
 			return
 		}
-		// Take the last NUM_CUBES from the list
-		allCubeNames := cubeListResp.Cubes
-		if len(allCubeNames) < NUM_CUBES {
-			fmt.Println("Not enough cubes returned from server!")
-			return
-		}
-		cubeNames = allCubeNames[len(allCubeNames)-NUM_CUBES:]
-		fmt.Printf("Cube names for %s test: %v\n", t, cubeNames)
+		snakeCubes := cubesList.Cubes[len(cubesList.Cubes)-NUM_CUBES:]
+		fmt.Printf("Our %s snake cubes: %v\n", t, snakeCubes)
 
-		// Step C: Connect consecutive cubes with either create_joint or create_bone
-		for i := 0; i < len(cubeNames)-1; i++ {
-			cubeA := cubeNames[i]
-			cubeB := cubeNames[i+1]
+		// Step C: Link consecutive cubes
+		var createdJointNames []string // store joint names to tweak parameters
+
+		for i := 0; i < len(snakeCubes)-1; i++ {
+			cA := snakeCubes[i]
+			cB := snakeCubes[i+1]
 
 			var createCmd map[string]interface{}
 			if t == "bone" {
-				// Use "create_bone" command
 				createCmd = map[string]interface{}{
-					"type":     "create_bone",
-					"cube1":    cubeA,
-					"cube2":    cubeB,
-					"snake_id": "testSnake", // optional ID
+					"type":  "create_bone",
+					"cube1": cA,
+					"cube2": cB,
 				}
 			} else {
-				// Use "create_joint" command
 				createCmd = map[string]interface{}{
 					"type":       "create_joint",
-					"cube1":      cubeA,
-					"cube2":      cubeB,
+					"cube1":      cA,
+					"cube2":      cB,
 					"joint_type": t,
 				}
 			}
 
-			cmdBytes, _ := json.Marshal(createCmd)
-			if err := sendMessage(conn, string(cmdBytes)); err != nil {
-				fmt.Printf("Failed to create %s link between %s and %s: %v\n", t, cubeA, cubeB, err)
+			if err := sendCommand(conn, createCmd); err != nil {
+				fmt.Printf("create link error: %v\n", err)
 				continue
 			}
-			// Wait for and verify the response
-			jointRespStr, err := receiveMessage(conn)
+
+			// Read the response (joint_created or bone_created)
+			linkRespStr, err := receiveMessage(conn)
 			if err != nil {
-				fmt.Printf("Failed to receive link creation response: %v\n", err)
+				fmt.Printf("Error reading link creation response: %v\n", err)
 				continue
 			}
-			var jointResp map[string]interface{}
-			if err := json.Unmarshal([]byte(jointRespStr), &jointResp); err != nil {
-				fmt.Printf("Failed to parse link creation response: %v\n", err)
+			var linkRes JointCreationResponse
+			if err := json.Unmarshal([]byte(linkRespStr), &linkRes); err != nil {
+				fmt.Printf("Error decoding creation response: %v\n", err)
 				continue
 			}
-			respType, ok := jointResp["type"].(string)
-			if t == "bone" {
-				if !ok || respType != "bone_created" {
-					fmt.Printf("Invalid bone creation response: %v\n", jointResp["type"])
-					continue
-				}
-				fmt.Printf("Created bone between %s and %s\n", cubeA, cubeB)
+
+			if t == "bone" && linkRes.Type == "bone_created" {
+				fmt.Printf("[Client] Created bone between %s & %s => name=%s\n", cA, cB, linkRes.JointName)
+				// We can treat that as a “joint name” if we wanted to set param, but currently
+				// we only set param on “joint_created” – so do nothing special here
+			} else if t != "bone" && linkRes.Type == "joint_created" {
+				fmt.Printf("[Client] Created joint '%s' for %s => name=%s\n", t, cA+"->"+cB, linkRes.JointName)
+				// store the joint name so we can set params
+				createdJointNames = append(createdJointNames, linkRes.JointName)
 			} else {
-				if !ok || respType != "joint_created" {
-					fmt.Printf("Invalid joint creation response: %v\n", jointResp["type"])
-					continue
-				}
-				fmt.Printf("Created %s joint between %s and %s\n", t, cubeA, cubeB)
+				fmt.Printf("Unexpected creation response: %s\n", linkRes.Type)
 			}
+
 			time.Sleep(100 * time.Millisecond)
 		}
 
-		// Step D: Apply force to the "head" of the snake
-		headCube := cubeNames[0]
+		// Step C2: Optionally set joint parameters for pin or hinge or slider
+		// For example, if it's pin: set "bias", "damping" to 1.0, "impulse_clamp"=0
+		// If it's hinge: set "limit_upper=45" or "limit_softness=1.0" etc.
+
+		switch t {
+		case "pin":
+			// For each created pin joint, set some stiffness
+			for _, jointName := range createdJointNames {
+				// Example: set "bias"=1
+				setParamCmd := map[string]interface{}{
+					"type":       "set_joint_param",
+					"joint_name": jointName,
+					"param_name": "bias",
+					"value":      1.0,
+				}
+				_ = sendCommand(conn, setParamCmd)
+				time.Sleep(100 * time.Millisecond)
+
+				// set "damping"=1
+				setParamCmd = map[string]interface{}{
+					"type":       "set_joint_param",
+					"joint_name": jointName,
+					"param_name": "damping",
+					"value":      1.0,
+				}
+				_ = sendCommand(conn, setParamCmd)
+				time.Sleep(100 * time.Millisecond)
+
+				// set "impulse_clamp"=0
+				setParamCmd = map[string]interface{}{
+					"type":       "set_joint_param",
+					"joint_name": jointName,
+					"param_name": "impulse_clamp",
+					"value":      0.0,
+				}
+				_ = sendCommand(conn, setParamCmd)
+				time.Sleep(100 * time.Millisecond)
+
+				fmt.Printf("Set stiff params on pin joint '%s'\n", jointName)
+			}
+
+		case "hinge":
+			// For each hinge, set upper limit=45, softness=1, bias=1, relaxation=1
+			for _, jointName := range createdJointNames {
+				// limit_upper=45
+				setParamCmd := map[string]interface{}{
+					"type":       "set_joint_param",
+					"joint_name": jointName,
+					"param_name": "limit_upper",
+					"value":      45.0,
+				}
+				_ = sendCommand(conn, setParamCmd)
+				time.Sleep(100 * time.Millisecond)
+
+				// limit_softness=1
+				setParamCmd = map[string]interface{}{
+					"type":       "set_joint_param",
+					"joint_name": jointName,
+					"param_name": "limit_softness",
+					"value":      1.0,
+				}
+				_ = sendCommand(conn, setParamCmd)
+				time.Sleep(100 * time.Millisecond)
+
+				// limit_bias=1
+				setParamCmd = map[string]interface{}{
+					"type":       "set_joint_param",
+					"joint_name": jointName,
+					"param_name": "limit_bias",
+					"value":      1.0,
+				}
+				_ = sendCommand(conn, setParamCmd)
+				time.Sleep(100 * time.Millisecond)
+
+				// limit_relaxation=1
+				setParamCmd = map[string]interface{}{
+					"type":       "set_joint_param",
+					"joint_name": jointName,
+					"param_name": "limit_relaxation",
+					"value":      1.0,
+				}
+				_ = sendCommand(conn, setParamCmd)
+				time.Sleep(100 * time.Millisecond)
+
+				fmt.Printf("Set stiff hinge params on hinge '%s'\n", jointName)
+			}
+
+		case "slider":
+			// For slider, you could do "linear_limit_lower" or "linear_limit_upper", etc.
+			// e.g. set an upper limit=5
+			for _, jointName := range createdJointNames {
+				setParamCmd := map[string]interface{}{
+					"type":       "set_joint_param",
+					"joint_name": jointName,
+					"param_name": "linear_limit_upper",
+					"value":      5.0,
+				}
+				_ = sendCommand(conn, setParamCmd)
+				time.Sleep(100 * time.Millisecond)
+				fmt.Printf("Set upper limit=5 on slider '%s'\n", jointName)
+			}
+
+		case "conetwist":
+			// similarly "swing_span", "twist_span", "bias", "softness", etc.
+			for _, jointName := range createdJointNames {
+				setParamCmd := map[string]interface{}{
+					"type":       "set_joint_param",
+					"joint_name": jointName,
+					"param_name": "swing_span",
+					"value":      30.0,
+				}
+				_ = sendCommand(conn, setParamCmd)
+				time.Sleep(100 * time.Millisecond)
+
+				setParamCmd = map[string]interface{}{
+					"type":       "set_joint_param",
+					"joint_name": jointName,
+					"param_name": "twist_span",
+					"value":      60.0,
+				}
+				_ = sendCommand(conn, setParamCmd)
+				time.Sleep(100 * time.Millisecond)
+
+				setParamCmd = map[string]interface{}{
+					"type":       "set_joint_param",
+					"joint_name": jointName,
+					"param_name": "bias",
+					"value":      1.0,
+				}
+				_ = sendCommand(conn, setParamCmd)
+				time.Sleep(100 * time.Millisecond)
+
+				fmt.Printf("Set conetwist params on joint '%s'\n", jointName)
+			}
+
+		case "bone":
+			// "bone" isn't physically a separate joint type on the server, so no param calls here
+		}
+
+		// Step D: Apply force to the head cube
+		headCube := snakeCubes[0]
 		for i := 0; i < 10; i++ {
-			applyForceCmd := map[string]interface{}{
+			forceCmd := map[string]interface{}{
 				"type":      "apply_force",
 				"cube_name": headCube,
-				"force":     []float64{10, 0, 0}, // Force along +X
+				"force":     []float64{10, 0, 0},
 			}
-			forceCmdBytes, _ := json.Marshal(applyForceCmd)
-			if err := sendMessage(conn, string(forceCmdBytes)); err != nil {
-				fmt.Printf("Failed to apply force to %s: %v\n", headCube, err)
-			} else {
-				fmt.Printf("Applied force to head cube %s\n", headCube)
-			}
-			time.Sleep(100 * time.Millisecond)
+			_ = sendCommand(conn, forceCmd)
+			fmt.Printf("Applied force to %s\n", headCube)
+			time.Sleep(200 * time.Millisecond)
 		}
 
-		// Step E: Observe for 5 seconds
-		fmt.Printf("Observing %s snake behavior for %v...\n", t, TEST_DURATION)
+		// Step E: observe
+		fmt.Printf("[Client] Observing %s snake for %v...\n", t, TEST_DURATION)
 		time.Sleep(TEST_DURATION)
 
-		// Step F: Despawn the cubes
-		for _, c := range cubeNames {
-			despawnCubeCmd := map[string]interface{}{
+		// Step F: despawn
+		for _, c := range snakeCubes {
+			delCmd := map[string]interface{}{
 				"type":      "despawn_cube",
 				"cube_name": c,
 			}
-			cmdBytes, _ := json.Marshal(despawnCubeCmd)
-			if err := sendMessage(conn, string(cmdBytes)); err != nil {
-				fmt.Printf("Failed to despawn cube %s: %v\n", c, err)
-			} else {
-				fmt.Printf("Despawned cube %s\n", c)
-			}
+			_ = sendCommand(conn, delCmd)
 			time.Sleep(100 * time.Millisecond)
+			fmt.Printf("Despawned cube %s\n", c)
 		}
-
-		fmt.Printf("=== Finished testing %s ===\n", t)
+		fmt.Printf("=== Done with %s ===\n", t)
 	}
 
-	fmt.Println("All joint/bone tests completed successfully!")
+	fmt.Println("All joint/bone tests completed.")
+}
+
+// sendCommand: marshals the cmd to JSON, calls sendMessage
+func sendCommand(conn net.Conn, cmd map[string]interface{}) error {
+	data, err := json.Marshal(cmd)
+	if err != nil {
+		return fmt.Errorf("json marshal error: %v", err)
+	}
+	return sendMessage(conn, string(data))
 }
