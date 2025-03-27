@@ -13,7 +13,7 @@ import (
 )
 
 const (
-	ServerIP      = "127.0.0.1"
+	ServerIP      = "192.168.0.228"
 	ServerPort    = 14000
 	SharedPass    = "my_secure_password"
 	EndOfMsg      = "<???DONE???---" // Must match the Godot server's marker
